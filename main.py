@@ -1,4 +1,8 @@
 import re
+from io import BytesIO
+
+import fitz
+from fastapi import File, Form, HTTPException, UploadFile
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
@@ -56,11 +60,9 @@ def extract_skills(text: str) -> list[str]:
 
     return found
 
-
-@app.post("/analyze")
-def analyze_resume(request: AnalyzeRequest):
-    resume_skills = extract_skills(request.resume_text)
-    required_skills = extract_skills(request.job_description)
+def analyze_text(resume_text: str, job_description: str) -> dict:
+    resume_skills = extract_skills(resume_text)
+    required_skills = extract_skills(job_description)
 
     matched_skills = [
         skill for skill in required_skills
@@ -90,3 +92,73 @@ def analyze_resume(request: AnalyzeRequest):
         "missing_skills": missing_skills,
         "match_score": match_score,
     }
+
+
+@app.post("/analyze")
+def analyze_resume(request: AnalyzeRequest):
+    return analyze_text(
+        request.resume_text,
+        request.job_description,
+    )
+
+MAX_PDF_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+@app.post("/analyze-pdf")
+async def analyze_pdf(
+    file: UploadFile = File(...),
+    job_description: str = Form(..., min_length=1, max_length=20000),
+):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a PDF file.",
+        )
+
+    pdf_bytes = await file.read(MAX_PDF_SIZE + 1)
+
+    if len(pdf_bytes) > MAX_PDF_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF must be 5 MB or smaller.",
+        )
+
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is not a valid PDF.",
+        )
+
+    try:
+        with fitz.open(stream=BytesIO(pdf_bytes), filetype="pdf") as document:
+            if document.is_encrypted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Password-protected PDFs are not supported.",
+                )
+
+            resume_text = "\n".join(
+                page.get_text() for page in document
+            ).strip()
+
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read this PDF. Please upload a valid PDF.",
+        )
+
+    if not resume_text:
+        raise HTTPException(
+            status_code=422,
+            detail="No extractable text found. Scanned PDFs are not supported yet.",
+        )
+
+    if not job_description.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Job description must not be blank.",
+        )
+
+    return analyze_text(resume_text, job_description)
